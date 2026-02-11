@@ -59,6 +59,10 @@ uv run hmcpl renew --all
 
 # Force re-login (clear cached session)
 uv run hmcpl --relogin status
+
+# Headless mode (for server environments like OpenClaw)
+uv run hmcpl bootstrap           # First: run once to save browser state
+uv run hmcpl --headless status   # Then: use headless mode for all commands
 ```
 
 ## Output
@@ -84,6 +88,34 @@ Example status output:
 - Subsequent runs use cached session cookies
 - Session cookies are stored in `~/.hmcpl_state.json`
 - Search requires a browser window due to Cloudflare protection
+
+### Headless Mode (Server Environments)
+
+For server environments without a display (like OpenClaw), you can use headless mode:
+
+1. **Bootstrap once** on a machine with a display:
+   ```bash
+   uv run hmcpl bootstrap
+   ```
+   This opens a browser, logs in, and saves the full browser state (cookies, localStorage, etc.) to `~/.hmcpl_browser_state.json`.
+
+2. **Copy the state file** to your server:
+   ```bash
+   scp ~/.hmcpl_browser_state.json server:~/.hmcpl_browser_state.json
+   ```
+
+3. **Use headless mode** on the server:
+   ```bash
+   uv run hmcpl --headless status
+   ```
+
+   Or set the environment variable for all commands:
+   ```bash
+   export HMCPL_HEADLESS=1
+   uv run hmcpl status  # Now runs headless automatically
+   ```
+
+Note: If the session expires, you'll need to re-run bootstrap on a machine with a display.
 
 ## Architecture
 
@@ -115,6 +147,15 @@ This project includes a Claude Code plugin that allows you to manage your librar
    ```
 
 5. Enable the plugin in Claude Code settings or restart Claude Code
+
+6. **For server environments** (headless mode):
+   ```bash
+   # Bootstrap once on a machine with a display
+   uv run hmcpl bootstrap
+
+   # Copy state file to server and set headless mode
+   export HMCPL_HEADLESS=1
+   ```
 
 ### Available Slash Commands
 

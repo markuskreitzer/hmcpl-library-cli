@@ -15,18 +15,21 @@ from hmcpl.parser import parse_checkouts_html, parse_holds_html, parse_search_re
 
 BASE_URL = "https://catalog.hmcpl.org"
 STATE_FILE = Path.home() / ".hmcpl_state.json"
+BROWSER_STATE_FILE = Path.home() / ".hmcpl_browser_state.json"
 
 
 class HMCPLClient:
     """Client for interacting with HMCPL library system."""
 
-    def __init__(self, barcode: str, pin: str):
+    def __init__(self, barcode: str, pin: str, headless: bool = False):
         self.barcode = barcode
         self.pin = pin
+        self.headless = headless
         self.cookies: dict[str, str] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._playwright = None
 
     async def __aenter__(self):
         return self
@@ -45,6 +48,9 @@ class HMCPLClient:
         if self._browser:
             await self._browser.close()
             self._browser = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
 
     def _save_cookies(self):
         """Save cookies to state file."""
@@ -78,19 +84,37 @@ class HMCPLClient:
             )
         return self._http_client
 
+    async def _save_browser_state(self):
+        """Save browser state (cookies, localStorage, etc.) for headless reuse."""
+        if self._context:
+            await self._context.storage_state(path=str(BROWSER_STATE_FILE))
+
+    def _has_browser_state(self) -> bool:
+        """Check if saved browser state exists."""
+        return BROWSER_STATE_FILE.exists()
+
     async def _get_browser_context(self) -> BrowserContext:
         """Get or create a browser context."""
         if self._context is None:
-            pw = await async_playwright().start()
-            # Use headed mode to bypass Cloudflare's bot detection
-            self._browser = await pw.chromium.launch(
-                headless=False,
+            self._playwright = await async_playwright().start()
+
+            # In headless mode, try to use saved browser state
+            # If no state exists, will need to bootstrap with headed mode first
+            use_headless = self.headless and self._has_browser_state()
+
+            self._browser = await self._playwright.chromium.launch(
+                headless=use_headless,
                 args=["--disable-blink-features=AutomationControlled"],
             )
+
+            # Load saved state if available (for headless mode)
+            storage_state = str(BROWSER_STATE_FILE) if self._has_browser_state() else None
+
             self._context = await self._browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US",
+                storage_state=storage_state,
             )
             # Hide webdriver property
             await self._context.add_init_script("""
@@ -178,6 +202,9 @@ class HMCPLClient:
                 cookies = await context.cookies()
                 self.cookies = {c["name"]: c["value"] for c in cookies}
                 self._save_cookies()
+
+                # Save full browser state for headless reuse
+                await self._save_browser_state()
 
                 # Reset HTTP client to use new cookies
                 if self._http_client:
@@ -488,7 +515,11 @@ class HMCPLClient:
         return []
 
 
-async def create_client(barcode: str | None = None, pin: str | None = None) -> HMCPLClient:
+async def create_client(
+    barcode: str | None = None,
+    pin: str | None = None,
+    headless: bool = False,
+) -> HMCPLClient:
     """Create and login a client, reading credentials from env if not provided."""
     import os
     from dotenv import load_dotenv
@@ -501,7 +532,7 @@ async def create_client(barcode: str | None = None, pin: str | None = None) -> H
     if not barcode or not pin:
         raise ValueError("HMCPL_BARCODE and HMCPL_PIN must be set")
 
-    client = HMCPLClient(barcode, pin)
+    client = HMCPLClient(barcode, pin, headless=headless)
     if not await client.login():
         raise Exception("Failed to login to HMCPL")
 

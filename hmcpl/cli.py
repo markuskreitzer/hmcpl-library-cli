@@ -6,10 +6,11 @@ import json
 import os
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-from hmcpl.client import HMCPLClient
+from hmcpl.client import HMCPLClient, BROWSER_STATE_FILE
 from hmcpl.models import AccountSummary, Checkout, Hold, SearchResult
 
 
@@ -110,6 +111,36 @@ async def cmd_locations(client: HMCPLClient, args):
     output_json({"locations": locations})
 
 
+async def cmd_bootstrap(args):
+    """Bootstrap browser state for headless mode (requires headed browser)."""
+    load_dotenv()
+
+    barcode = os.getenv("HMCPL_BARCODE")
+    pin = os.getenv("HMCPL_PIN")
+
+    if not barcode or not pin:
+        error("HMCPL_BARCODE and HMCPL_PIN environment variables must be set")
+
+    # Force headed mode for bootstrap
+    client = HMCPLClient(barcode, pin, headless=False)
+
+    try:
+        print("Opening browser for login... Please complete any challenges if prompted.", file=sys.stderr)
+        if await client.login(force=True):
+            if BROWSER_STATE_FILE.exists():
+                output_json({
+                    "success": True,
+                    "message": "Browser state saved. You can now use --headless mode.",
+                    "state_file": str(BROWSER_STATE_FILE),
+                })
+            else:
+                error("Login succeeded but browser state was not saved")
+        else:
+            error("Failed to login to HMCPL")
+    finally:
+        await client.close()
+
+
 async def run_command(args):
     """Run the specified command."""
     load_dotenv()
@@ -120,7 +151,9 @@ async def run_command(args):
     if not barcode or not pin:
         error("HMCPL_BARCODE and HMCPL_PIN environment variables must be set")
 
-    client = HMCPLClient(barcode, pin)
+    # Headless mode: CLI flag or environment variable
+    headless = getattr(args, "headless", False) or os.getenv("HMCPL_HEADLESS", "").lower() in ("1", "true", "yes")
+    client = HMCPLClient(barcode, pin, headless=headless)
 
     try:
         # Login
@@ -141,6 +174,7 @@ def main():
         description="HMCPL Library Manager - CLI for Huntsville-Madison County Public Library",
     )
     parser.add_argument("--relogin", action="store_true", help="Force re-login (ignore cached session)")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode (requires bootstrap first)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -183,10 +217,21 @@ def main():
     locations_parser = subparsers.add_parser("locations", help="List pickup locations")
     locations_parser.set_defaults(func=cmd_locations)
 
+    # bootstrap command (for headless mode setup)
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Bootstrap browser state for headless mode (opens browser for login)",
+    )
+    bootstrap_parser.set_defaults(func=None, is_bootstrap=True)
+
     args = parser.parse_args()
 
     try:
-        asyncio.run(run_command(args))
+        # Bootstrap is a special command that doesn't need the normal client flow
+        if getattr(args, "is_bootstrap", False):
+            asyncio.run(cmd_bootstrap(args))
+        else:
+            asyncio.run(run_command(args))
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as e:
