@@ -122,7 +122,8 @@ async def cmd_bootstrap(args):
         error("HMCPL_BARCODE and HMCPL_PIN environment variables must be set")
 
     # Force headed mode for bootstrap
-    client = HMCPLClient(barcode, pin, headless=False)
+    timeout = getattr(args, "timeout", 60)
+    client = HMCPLClient(barcode, pin, headless=False, timeout=timeout)
 
     try:
         print("Opening browser for login... Please complete any challenges if prompted.", file=sys.stderr)
@@ -153,7 +154,8 @@ async def run_command(args):
 
     # Headless mode: CLI flag or environment variable
     headless = getattr(args, "headless", False) or os.getenv("HMCPL_HEADLESS", "").lower() in ("1", "true", "yes")
-    client = HMCPLClient(barcode, pin, headless=headless)
+    timeout = getattr(args, "timeout", 60)
+    client = HMCPLClient(barcode, pin, headless=headless, timeout=timeout)
 
     try:
         # Login
@@ -175,6 +177,7 @@ def main():
     )
     parser.add_argument("--relogin", action="store_true", help="Force re-login (ignore cached session)")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode (requires bootstrap first)")
+    parser.add_argument("--timeout", type=int, default=60, help="Browser operation timeout in seconds (default: 60)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 

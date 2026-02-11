@@ -311,6 +311,145 @@ def parse_search_results_html(html: str) -> list[SearchResult]:
     return results
 
 
+def parse_account_summary_page(html: str) -> dict:
+    """Parse account summary from rendered MyAccount/Home page."""
+    soup = BeautifulSoup(html, "lxml")
+    result = {}
+
+    # Extract name from header area
+    name_elem = soup.select_one("span.menu-bar-label, .displayNameLink, #displayNameLink")
+    if name_elem:
+        name = name_elem.get_text(strip=True)
+        if name:
+            result["name"] = name
+
+    # Extract summary counts from the account summary section
+    # Look for dashboard widgets with specific IDs or classes
+    body_text = soup.get_text()
+
+    # Parse "CHECKED OUT TITLES" count
+    for pattern, key in [
+        (r"CHECKED OUT TITLES\s*(\d+)", "numCheckedOut"),
+        (r"OVERDUE\s*(\d+)", "numOverdue"),
+        (r"TITLES ON HOLD\s*(\d+)", "numHolds"),
+        (r"READY FOR PICKUP\s*(\d+)", "numAvailableHolds"),
+    ]:
+        match = re.search(pattern, body_text, re.IGNORECASE)
+        if match:
+            result[key] = int(match.group(1))
+
+    # Extract fines from sidebar: "Fees $0.00"
+    fines_match = re.search(r"Fees?\s*\$?([\d,.]+)", body_text)
+    if fines_match:
+        try:
+            result["totalFines"] = float(fines_match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # Extract expiration date if shown
+    exp_match = re.search(r"(?:expires?|expiration)\s*[:.]?\s*(\w+ \d{1,2},?\s*\d{4})", body_text, re.IGNORECASE)
+    if exp_match:
+        result["expires"] = exp_match.group(1)
+
+    return result
+
+
+def parse_checkouts_page(html: str) -> list[Checkout]:
+    """Parse checkouts from rendered MyAccount/CheckedOut full page."""
+    soup = BeautifulSoup(html, "lxml")
+    checkouts = []
+
+    # Aspen Discovery uses specific classes for checkout entries
+    rows = soup.select(".result, .listEntry, .ilsCheckoutEntry, .checkoutEntry")
+
+    for row in rows:
+        try:
+            # Extract item ID
+            item_id = None
+            # Look for data attributes
+            item_id = row.get("data-id") or row.get("id", "")
+            if not item_id or item_id.startswith("listEntry"):
+                id_elem = row.select_one("input[name*='selected'], input[type='checkbox']")
+                if id_elem:
+                    item_id = id_elem.get("value") or id_elem.get("name", "").split("|")[-1]
+            if not item_id:
+                item_id = f"checkout-{len(checkouts)}"
+
+            # Extract title
+            title_elem = row.select_one(".result-title, a.result-title, .title a, .title")
+            title = title_elem.get_text(strip=True) if title_elem else "Unknown Title"
+
+            # Extract author
+            author = None
+            labels = row.select(".result-label")
+            for label in labels:
+                if "author" in label.get_text(strip=True).lower():
+                    value = label.find_next_sibling(class_="result-value")
+                    if value:
+                        author = value.get_text(strip=True)
+                        break
+            if not author:
+                author_elem = row.select_one(".result-author, .author")
+                if author_elem:
+                    author = author_elem.get_text(strip=True)
+            if author and author.lower().startswith("by "):
+                author = author[3:]
+
+            # Extract due date
+            due_date = None
+            for label in labels:
+                label_text = label.get_text(strip=True).lower()
+                if "due" in label_text:
+                    value = label.find_next_sibling(class_="result-value")
+                    if value:
+                        date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})", value.get_text())
+                        if date_match:
+                            due_date = parse_date(date_match.group(1))
+                        else:
+                            # Try "Month Day, Year" format
+                            due_date = parse_date(value.get_text(strip=True))
+                        break
+            if not due_date:
+                due_elem = row.select_one(".dueDate, .due-date")
+                if due_elem:
+                    date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})", due_elem.get_text())
+                    if date_match:
+                        due_date = parse_date(date_match.group(1))
+
+            # Extract format
+            format_elem = row.select_one(".format, .itemType, .material-type, .manifestation-format")
+            item_format = format_elem.get_text(strip=True) if format_elem else None
+
+            # Check if renewable
+            can_renew = True
+            renew_btn = row.select_one("button.renewButton, .renewOption, a.renewButton")
+            if renew_btn and renew_btn.get("disabled"):
+                can_renew = False
+            no_renew = row.select_one(".noRenew, .cannot-renew")
+            if no_renew:
+                can_renew = False
+
+            # Cover image
+            cover_elem = row.select_one("img[src*='bookcover'], img.use-original-covers")
+            cover_url = cover_elem.get("src") if cover_elem else None
+
+            checkouts.append(
+                Checkout(
+                    id=item_id,
+                    title=title,
+                    author=author,
+                    due_date=due_date,
+                    format=item_format,
+                    can_renew=can_renew,
+                    cover_url=cover_url,
+                )
+            )
+        except Exception:
+            continue
+
+    return checkouts
+
+
 def extract_csrf_token(html: str) -> str | None:
     """Extract CSRF token from page HTML."""
     soup = BeautifulSoup(html, "lxml")

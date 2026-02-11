@@ -5,12 +5,14 @@ import json
 import re
 from datetime import date
 from pathlib import Path
-
 import httpx
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from hmcpl.models import AccountSummary, Checkout, Hold, SearchResult, HoldResult, RenewResult
-from hmcpl.parser import parse_checkouts_html, parse_holds_html, parse_search_results_html, parse_date
+from hmcpl.parser import (
+    parse_checkouts_html, parse_holds_html, parse_search_results_html, parse_date,
+    parse_account_summary_page, parse_checkouts_page,
+)
 
 
 BASE_URL = "https://catalog.hmcpl.org"
@@ -21,15 +23,17 @@ BROWSER_STATE_FILE = Path.home() / ".hmcpl_browser_state.json"
 class HMCPLClient:
     """Client for interacting with HMCPL library system."""
 
-    def __init__(self, barcode: str, pin: str, headless: bool = False):
+    def __init__(self, barcode: str, pin: str, headless: bool = False, timeout: int = 60):
         self.barcode = barcode
         self.pin = pin
         self.headless = headless
+        self.timeout = timeout  # timeout in seconds for browser operations
         self.cookies: dict[str, str] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._playwright = None
+        self._api_page: Page | None = None
 
     async def __aenter__(self):
         return self
@@ -42,6 +46,9 @@ class HMCPLClient:
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+        if self._api_page:
+            await self._api_page.close()
+            self._api_page = None
         if self._context:
             await self._context.close()
             self._context = None
@@ -57,14 +64,27 @@ class HMCPLClient:
         STATE_FILE.write_text(json.dumps({"cookies": self.cookies}))
 
     def _load_cookies(self) -> bool:
-        """Load cookies from state file."""
+        """Load cookies from state file, falling back to browser state."""
         if STATE_FILE.exists():
             try:
                 data = json.loads(STATE_FILE.read_text())
                 self.cookies = data.get("cookies", {})
-                return bool(self.cookies)
+                if self.cookies:
+                    return True
             except (json.JSONDecodeError, KeyError):
                 pass
+
+        # Fall back to extracting cookies from browser state file
+        if BROWSER_STATE_FILE.exists():
+            try:
+                data = json.loads(BROWSER_STATE_FILE.read_text())
+                browser_cookies = data.get("cookies", [])
+                self.cookies = {c["name"]: c["value"] for c in browser_cookies}
+                if self.cookies:
+                    return True
+            except (json.JSONDecodeError, KeyError):
+                pass
+
         return False
 
     @property
@@ -98,8 +118,13 @@ class HMCPLClient:
         if self._context is None:
             self._playwright = await async_playwright().start()
 
-            # In headless mode, try to use saved browser state
-            # If no state exists, will need to bootstrap with headed mode first
+            # In headless mode, require saved browser state
+            if self.headless and not self._has_browser_state():
+                raise Exception(
+                    "Headless mode requires browser state from a prior bootstrap. "
+                    "Run 'hmcpl bootstrap' from a machine with a display first."
+                )
+
             use_headless = self.headless and self._has_browser_state()
 
             self._browser = await self._playwright.chromium.launch(
@@ -124,6 +149,27 @@ class HMCPLClient:
             """)
         return self._context
 
+    async def _get_page(self) -> Page:
+        """Get a persistent browser page, reusing it across operations.
+
+        Cloudflare blocks new pages opened after the first in a context,
+        so we must reuse a single page for all headless navigation.
+        """
+        if self._api_page is None or self._api_page.is_closed():
+            context = await self._get_browser_context()
+            self._api_page = await context.new_page()
+        return self._api_page
+
+    async def _navigate(self, path: str, wait_extra: int = 3000) -> Page:
+        """Navigate the persistent page to a path, skipping if already there."""
+        page = await self._get_page()
+        target = f"{BASE_URL}{path}"
+        if not page.url.startswith(target):
+            timeout_ms = self.timeout * 1000
+            await page.goto(target, wait_until="load", timeout=timeout_ms)
+            await page.wait_for_timeout(wait_extra)
+        return page
+
     async def login(self, force: bool = False) -> bool:
         """
         Login to HMCPL using Playwright, extract session cookies.
@@ -136,16 +182,28 @@ class HMCPLClient:
             if await self._verify_session():
                 return True
 
+        # In headless mode, try browser-based login using saved state.
+        if self.headless:
+            if self._has_browser_state():
+                refreshed = await self._headless_login()
+                if refreshed:
+                    return True
+            raise Exception(
+                "Session expired and headless mode could not refresh it automatically. "
+                "Please re-run 'hmcpl bootstrap' from a machine with a display to refresh browser state."
+            )
+
         context = await self._get_browser_context()
         page = await context.new_page()
-        page.set_default_timeout(60000)  # 60 second timeout
+        timeout_ms = self.timeout * 1000
+        page.set_default_timeout(timeout_ms)
 
         try:
             # Navigate to login page - use 'load' instead of 'networkidle' for reliability
-            await page.goto(f"{BASE_URL}/MyAccount/Home", wait_until="load", timeout=60000)
+            await page.goto(f"{BASE_URL}/MyAccount/Home", wait_until="load", timeout=timeout_ms)
 
             # Wait for login form
-            await page.wait_for_selector("#username", timeout=30000)
+            await page.wait_for_selector("#username", timeout=timeout_ms)
 
             # Fill in credentials
             await page.fill("#username", self.barcode)
@@ -218,13 +276,72 @@ class HMCPLClient:
         finally:
             await page.close()
 
+    async def _headless_login(self) -> bool:
+        """Use headless browser with saved state to login and refresh session."""
+        try:
+            page = await self._navigate("/MyAccount/Home", wait_extra=5000)
+
+            # Check if we landed on the account page (already logged in via saved state)
+            title = await page.title()
+
+            if "My Account" in title or "Checked Out" in title:
+                # Session from saved state is still valid
+                context = await self._get_browser_context()
+                cookies = await context.cookies()
+                self.cookies = {c["name"]: c["value"] for c in cookies}
+                self._save_cookies()
+                await self._save_browser_state()
+                return True
+
+            # If we're on the login page, try to log in
+            username_field = await page.query_selector("#username")
+            if username_field:
+                await page.fill("#username", self.barcode)
+                await page.fill("#password", self.pin)
+
+                remember_me = await page.query_selector("#rememberMe")
+                if remember_me:
+                    await remember_me.check()
+
+                submit_btn = await page.query_selector("#loginFormSubmit")
+                if submit_btn:
+                    async with page.expect_navigation():
+                        await submit_btn.click()
+                else:
+                    async with page.expect_navigation():
+                        await page.press("#password", "Enter")
+
+                await page.wait_for_load_state("load")
+                await page.wait_for_timeout(3000)
+
+                title = await page.title()
+                if "My Account" in title or "Checked Out" in title:
+                    context = await self._get_browser_context()
+                    cookies = await context.cookies()
+                    self.cookies = {c["name"]: c["value"] for c in cookies}
+                    self._save_cookies()
+                    await self._save_browser_state()
+                    return True
+
+            return False
+        except Exception:
+            return False
+
     async def _verify_session(self) -> bool:
         """Verify that current session cookies are still valid."""
+        if self.headless:
+            # In headless mode, AJAX endpoints are blocked by Cloudflare.
+            # Verify by navigating to the account page via the browser.
+            try:
+                page = await self._navigate("/MyAccount/Home")
+                title = await page.title()
+                return "My Account" in title or "Checked Out" in title
+            except Exception:
+                return False
         try:
             resp = await self.http_client.get("/MyAccount/AJAX", params={"method": "getMenuDataIls"})
             if resp.status_code == 200:
                 data = resp.json()
-                # If we get a valid response with account info, session is valid
                 return data.get("success", False) or "numCheckedOut" in str(data)
         except Exception:
             pass
@@ -232,9 +349,11 @@ class HMCPLClient:
 
     async def get_account_summary(self) -> AccountSummary:
         """Get account summary (checkouts, holds, fines, expiration)."""
+        if self.headless:
+            return await self._get_account_summary_headless()
+
         resp = await self.http_client.get("/MyAccount/AJAX", params={"method": "getMenuDataIls"})
         resp.raise_for_status()
-
         data = resp.json()
 
         # Parse response - the data is nested under "summary" key
@@ -270,14 +389,50 @@ class HMCPLClient:
 
         return result
 
+    async def _get_account_summary_headless(self) -> AccountSummary:
+        """Get account summary by scraping the rendered page (headless mode)."""
+        page = await self._navigate("/MyAccount/Home", wait_extra=5000)
+
+        html = await page.content()
+        data = parse_account_summary_page(html)
+
+        # Name is loaded via JS asynchronously — extract from live DOM
+        name = await page.evaluate("""() => {
+            const spans = document.querySelectorAll('span.menu-bar-label');
+            for (const s of spans) {
+                const t = s.innerText.trim();
+                if (t && !['BROWSE','ADVANCED SEARCH','LISTS','EVENTS','RESEARCH','HELP'].includes(t))
+                    return t;
+            }
+            return null;
+        }""")
+
+        result = AccountSummary()
+        result.num_checked_out = data.get("numCheckedOut", 0)
+        result.num_overdue = data.get("numOverdue", 0)
+        result.num_holds = data.get("numHolds", 0)
+        result.num_available_holds = data.get("numAvailableHolds", 0)
+        result.total_fines = data.get("totalFines", 0.0)
+        result.name = name
+
+        exp_str = data.get("expires")
+        if exp_str:
+            result.expires = parse_date(exp_str)
+
+        return result
+
     async def get_checkouts(self) -> list[Checkout]:
         """Get list of checked out items."""
+        if self.headless:
+            page = await self._navigate("/MyAccount/CheckedOut")
+            html = await page.content()
+            return parse_checkouts_page(html)
+
         resp = await self.http_client.get(
             "/MyAccount/AJAX",
             params={"method": "getCheckouts", "source": "all"},
         )
         resp.raise_for_status()
-
         data = resp.json()
         checkouts = []
 
@@ -309,13 +464,28 @@ class HMCPLClient:
         return checkouts
 
     async def get_holds(self) -> list[Hold]:
-        """Get list of holds."""
+        """Get list of holds.
+
+        Note: In headless mode, Cloudflare blocks the Holds page. Only the total
+        hold count is available from the account summary sidebar. Detailed hold
+        information requires non-headless mode.
+        """
+        if self.headless:
+            # Holds page is blocked by Cloudflare WAF in headless mode.
+            # Return empty list — callers can use get_account_summary() for counts.
+            import sys
+            print(
+                "Warning: Detailed holds are unavailable in headless mode "
+                "(Cloudflare blocks the Holds page). Use 'status' for hold counts.",
+                file=sys.stderr,
+            )
+            return []
+
         resp = await self.http_client.get(
             "/MyAccount/AJAX",
             params={"method": "getHolds", "source": "all"},
         )
         resp.raise_for_status()
-
         data = resp.json()
         holds = []
 
@@ -438,28 +608,44 @@ class HMCPLClient:
 
     async def renew_item(self, item_id: str) -> RenewResult:
         """Renew a specific checked out item."""
-        # Try AJAX renewal first
-        resp = await self.http_client.post(
-            "/MyAccount/AJAX",
-            data={
-                "method": "renewItem",
-                "itemId": item_id,
-                "itemBarcode": item_id,
-            },
-        )
+        # Try AJAX renewal first (works in non-headless mode)
+        if not self.headless:
+            resp = await self.http_client.post(
+                "/MyAccount/AJAX",
+                data={
+                    "method": "renewItem",
+                    "itemId": item_id,
+                    "itemBarcode": item_id,
+                },
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    success = data.get("success", False)
+                    message = data.get("message", "")
+                    new_due = parse_date(data.get("newDueDate"))
+                    return RenewResult(success=success, message=message, new_due_date=new_due)
+                except Exception:
+                    pass
 
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                success = data.get("success", False)
-                message = data.get("message", "")
-                new_due = parse_date(data.get("newDueDate"))
-                return RenewResult(success=success, message=message, new_due_date=new_due)
-            except Exception:
-                pass
+        # In headless mode (or if AJAX failed), try browser-based renewal
+        try:
+            page = await self._navigate("/MyAccount/CheckedOut")
 
-        # If AJAX didn't work, return failure
-        return RenewResult(success=False, message="Renewal failed - please try through the website")
+            # Find and click the renew button for this item
+            renew_btn = await page.query_selector(f"button.renewButton[data-id='{item_id}'], a[onclick*='{item_id}'][onclick*='renew' i]")
+            if renew_btn:
+                await renew_btn.click()
+                await page.wait_for_timeout(3000)
+                # Check for success message
+                alert = await page.query_selector(".alert-success, .success")
+                if alert:
+                    msg = await alert.inner_text()
+                    return RenewResult(success=True, message=msg.strip())
+
+            return RenewResult(success=False, message="Could not find renew button for this item")
+        except Exception as e:
+            return RenewResult(success=False, message=f"Renewal failed: {e}")
 
     async def renew_all(self) -> list[RenewResult]:
         """Renew all eligible items."""
@@ -519,6 +705,7 @@ async def create_client(
     barcode: str | None = None,
     pin: str | None = None,
     headless: bool = False,
+    timeout: int = 60,
 ) -> HMCPLClient:
     """Create and login a client, reading credentials from env if not provided."""
     import os
@@ -532,7 +719,7 @@ async def create_client(
     if not barcode or not pin:
         raise ValueError("HMCPL_BARCODE and HMCPL_PIN must be set")
 
-    client = HMCPLClient(barcode, pin, headless=headless)
+    client = HMCPLClient(barcode, pin, headless=headless, timeout=timeout)
     if not await client.login():
         raise Exception("Failed to login to HMCPL")
 
