@@ -1,0 +1,24 @@
+# Environment
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Playwright
+.playwright-mcp/
+
+# Cached session
+.hmcpl_state.json
+
+# Internal docs
+hmcpl-library-management-plan.md
