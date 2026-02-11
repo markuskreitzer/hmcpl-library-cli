@@ -92,3 +92,65 @@ The tool uses a hybrid approach:
 - **httpx** for AJAX API calls (faster for authenticated requests)
 
 Session cookies are extracted after Playwright login and reused with httpx for subsequent API calls.
+
+## Claude Code / OpenClaw Integration
+
+This project includes a Claude Code plugin that allows you to manage your library account using natural language commands.
+
+### Installation as Claude Code Plugin
+
+1. Clone this repository to a local directory
+2. Install the CLI tool:
+   ```bash
+   cd /path/to/hmcpl-library-cli
+   uv sync
+   uv run playwright install chromium
+   ```
+
+3. Create your `.env` file with credentials
+
+4. Symlink the plugin to your Claude Code plugins directory:
+   ```bash
+   ln -s /path/to/hmcpl-library-cli ~/.claude/plugins/hmcpl-library
+   ```
+
+5. Enable the plugin in Claude Code settings or restart Claude Code
+
+### Available Slash Commands
+
+Once installed, you can use these commands in Claude Code:
+
+| Command | Description |
+|---------|-------------|
+| `/library` | Full account overview (status, checkouts, holds) |
+| `/library-status` | Account status, fines, expiration |
+| `/library-checkouts` | View checked out items |
+| `/library-holds` | View holds and their status |
+| `/library-search` | Search the catalog |
+| `/library-hold` | Place a hold on an item |
+| `/library-renew` | Renew checked out items |
+
+### Example Usage
+
+```
+You: /library
+Claude: [Shows your complete library account overview]
+
+You: /library-search python programming books
+Claude: [Searches catalog and shows results]
+
+You: /library-hold
+Claude: What would you like to place a hold on?
+You: The first Python book from the search
+Claude: [Places hold and confirms]
+```
+
+### Natural Language
+
+You can also just ask naturally:
+
+- "What books do I have checked out?"
+- "Do I have any holds ready for pickup?"
+- "Search for books by Brandon Sanderson"
+- "Renew all my books"
+- "When does my library card expire?"

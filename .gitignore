@@ -22,3 +22,5 @@ build/
 
 # Internal docs
 hmcpl-library-management-plan.md
+# Build lock files
+uv.lock

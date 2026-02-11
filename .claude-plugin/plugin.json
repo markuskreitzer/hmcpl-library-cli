@@ -1,0 +1,7 @@
+{
+  "name": "hmcpl-library",
+  "description": "Manage your Huntsville-Madison County Public Library account - check status, view checkouts/holds, search catalog, and more",
+  "author": {
+    "name": "Markus Kreitzer"
+  }
+}
