@@ -11,7 +11,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from hmcpl.models import AccountSummary, Checkout, Hold, SearchResult, HoldResult, RenewResult
 from hmcpl.parser import (
     parse_checkouts_html, parse_holds_html, parse_search_results_html, parse_date,
-    parse_account_summary_page, parse_checkouts_page,
+    parse_account_summary_page, parse_checkouts_page, parse_holds_page,
 )
 
 
@@ -160,13 +160,21 @@ class HMCPLClient:
             self._api_page = await context.new_page()
         return self._api_page
 
-    async def _navigate(self, path: str, wait_extra: int = 3000) -> Page:
+    async def _navigate(self, path: str, wait_extra: int = 3000, wait_for_selector: str | None = None) -> Page:
         """Navigate the persistent page to a path, skipping if already there."""
         page = await self._get_page()
         target = f"{BASE_URL}{path}"
         if not page.url.startswith(target):
             timeout_ms = self.timeout * 1000
             await page.goto(target, wait_until="load", timeout=timeout_ms)
+            
+            # Wait for dynamic content to load (for checkouts/holds pages)
+            if wait_for_selector:
+                try:
+                    await page.wait_for_selector(wait_for_selector, timeout=timeout_ms)
+                except Exception:
+                    pass  # Fallback to time-based wait
+            
             await page.wait_for_timeout(wait_extra)
         return page
 
@@ -424,7 +432,24 @@ class HMCPLClient:
     async def get_checkouts(self) -> list[Checkout]:
         """Get list of checked out items."""
         if self.headless:
-            page = await self._navigate("/MyAccount/CheckedOut")
+            page = await self._navigate("/MyAccount/CheckedOut", wait_extra=8000)
+            
+            # Wait for dynamic content to load (AspenDiscovery loads via AJAX)
+            # Try to wait for the placeholder to be replaced
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const placeholder = document.getElementById('allCheckoutsPlaceholder');
+                        return !placeholder || placeholder.innerText !== 'Loading checkouts from all sources';
+                    }""",
+                    timeout=10000
+                )
+            except Exception:
+                pass  # Fallback to just waiting
+            
+            # Additional wait for rendering
+            await page.wait_for_timeout(2000)
+            
             html = await page.content()
             return parse_checkouts_page(html)
 
@@ -464,22 +489,37 @@ class HMCPLClient:
         return checkouts
 
     async def get_holds(self) -> list[Hold]:
-        """Get list of holds.
-
-        Note: In headless mode, Cloudflare blocks the Holds page. Only the total
-        hold count is available from the account summary sidebar. Detailed hold
-        information requires non-headless mode.
-        """
+        """Get list of holds."""
         if self.headless:
-            # Holds page is blocked by Cloudflare WAF in headless mode.
-            # Return empty list — callers can use get_account_summary() for counts.
-            import sys
-            print(
-                "Warning: Detailed holds are unavailable in headless mode "
-                "(Cloudflare blocks the Holds page). Use 'status' for hold counts.",
-                file=sys.stderr,
-            )
-            return []
+            # Try to load holds page with browser like we do for checkouts
+            page = await self._navigate("/MyAccount/Holds", wait_extra=8000)
+            
+            # Wait for dynamic content to load
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const placeholder = document.getElementById('allHoldsPlaceholder');
+                        return !placeholder || placeholder.innerText !== 'Loading holds from all sources';
+                    }""",
+                    timeout=10000
+                )
+            except Exception:
+                pass
+            
+            await page.wait_for_timeout(2000)
+            
+            html = await page.content()
+            
+            # Check if we got a Cloudflare block
+            if "cloudflare" in html.lower() and "challenge" in html.lower():
+                import sys
+                print(
+                    "Warning: Cloudflare blocked the holds page. Use 'status' for hold counts.",
+                    file=sys.stderr,
+                )
+                return []
+            
+            return parse_holds_page(html)
 
         resp = await self.http_client.get(
             "/MyAccount/AJAX",
