@@ -450,6 +450,131 @@ def parse_checkouts_page(html: str) -> list[Checkout]:
     return checkouts
 
 
+def parse_holds_page(html: str) -> list[Hold]:
+    """Parse holds from rendered MyAccount/Holds full page."""
+    soup = BeautifulSoup(html, "lxml")
+    holds = []
+
+    rows = soup.select(".result, .listEntry, .ilsHoldEntry, .holdEntry")
+
+    for row in rows:
+        try:
+            hold_id = None
+            hold_id = row.get("data-id") or row.get("id", "")
+            if not hold_id or hold_id.startswith("listEntry"):
+                id_elem = row.select_one("input[name*='selected'], input[type='checkbox']")
+                if id_elem:
+                    hold_id = id_elem.get("value") or id_elem.get("name", "").split("|")[-1]
+            if not hold_id:
+                hold_id = f"hold-{len(holds)}"
+
+            title_elem = row.select_one(".result-title, a.result-title, .title a, .title")
+            title = title_elem.get_text(strip=True) if title_elem else "Unknown Title"
+
+            author = None
+            labels = row.select(".result-label")
+            for label in labels:
+                label_text = label.get_text(strip=True).lower()
+                if "author" in label_text:
+                    value = label.find_next_sibling(class_="result-value")
+                    if value:
+                        author = value.get_text(strip=True)
+                        break
+            if not author:
+                author_elem = row.select_one(".result-author, .author")
+                if author_elem:
+                    author = author_elem.get_text(strip=True)
+            if author and author.lower().startswith("by "):
+                author = author[3:]
+
+            status = "pending"
+            for label in labels:
+                label_text = label.get_text(strip=True).lower()
+                if "status" in label_text:
+                    value = label.find_next_sibling(class_="result-value")
+                    if value:
+                        status_text = value.get_text(strip=True).lower()
+                        if "available" in status_text or "ready" in status_text:
+                            status = "available"
+                        elif "transit" in status_text:
+                            status = "in_transit"
+                        elif "suspend" in status_text or "frozen" in status_text:
+                            status = "suspended"
+                        elif "expired" in status_text:
+                            status = "expired"
+                    break
+
+            position = None
+            for label in labels:
+                label_text = label.get_text(strip=True).lower()
+                if "position" in label_text or "queue" in label_text:
+                    value = label.find_next_sibling(class_="result-value")
+                    if value:
+                        pos_match = re.search(r"(\d+)", value.get_text())
+                        if pos_match:
+                            position = int(pos_match.group(1))
+                    break
+
+            pickup_location = None
+            pickup_elem = row.select_one(".pickupLocation, .pickup, .location")
+            if pickup_elem:
+                pickup_location = pickup_elem.get_text(strip=True)
+            if not pickup_location:
+                for label in labels:
+                    label_text = label.get_text(strip=True).lower()
+                    if "pickup" in label_text or "location" in label_text:
+                        value = label.find_next_sibling(class_="result-value")
+                        if value:
+                            pickup_location = value.get_text(strip=True)
+                            break
+
+            exp_date = None
+            exp_elem = row.select_one(".expirationDate, .expires, .expiration")
+            if exp_elem:
+                exp_text = exp_elem.get_text(strip=True)
+                date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})", exp_text)
+                if date_match:
+                    exp_date = parse_date(date_match.group(1))
+            if not exp_date:
+                for label in labels:
+                    label_text = label.get_text(strip=True).lower()
+                    if "expire" in label_text or "expiration" in label_text:
+                        value = label.find_next_sibling(class_="result-value")
+                        if value:
+                            date_match = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{4})", value.get_text())
+                            if date_match:
+                                exp_date = parse_date(date_match.group(1))
+                            else:
+                                exp_date = parse_date(value.get_text(strip=True))
+                            break
+
+            is_frozen = "suspend" in status or "frozen" in status
+            frozen_elem = row.select_one(".frozen, .suspended, input[name*='freeze']:checked")
+            if frozen_elem:
+                is_frozen = True
+
+            cover_elem = row.select_one("img[src*='bookcover'], img.use-original-covers")
+            cover_url = cover_elem.get("src") if cover_elem else None
+
+            holds.append(
+                Hold(
+                    id=hold_id,
+                    title=title,
+                    author=author,
+                    status=status,
+                    position=position,
+                    pickup_location=pickup_location,
+                    expiration_date=exp_date,
+                    is_frozen=is_frozen,
+                    cover_url=cover_url,
+                )
+            )
+        except Exception:
+            continue
+
+    return holds
+
+
 def extract_csrf_token(html: str) -> str | None:
     """Extract CSRF token from page HTML."""
     soup = BeautifulSoup(html, "lxml")
